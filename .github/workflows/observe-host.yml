@@ -1,0 +1,305 @@
+name: Observe hosted runner only
+on:
+  workflow_dispatch:
+    inputs:
+      expected_repository:
+        description: Exact approved owner/repository
+        required: true
+        type: string
+      expected_commit:
+        description: Exact approved full workflow commit SHA
+        required: true
+        type: string
+permissions: {}
+jobs:
+  observe:
+    if: github.event_name == 'workflow_dispatch' && github.repository == inputs.expected_repository && github.sha == inputs.expected_commit && github.workflow_sha == inputs.expected_commit && github.event.repository.private == false
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Read bounded sanitized host capability summary
+        shell: bash --noprofile --norc -e -o pipefail {0}
+        run: |
+          /usr/bin/python3 -I -B - <<'PY'
+          """Observe-only hosted-runner probe. No package or resource lifecycle operation.
+          
+          Never promote this sanitized summary to publisher provenance or start authority.
+          """
+          
+          import hashlib
+          import json
+          import os
+          import re
+          import selectors
+          import signal
+          import stat
+          import subprocess
+          import time
+          from pathlib import Path
+          
+          BASE = "1691d9855c2123bae6c43b06cc7cd168fe32b40c"
+          CONFIG = "/var/empty/profile-preflight-no-config"
+          ENV = {
+              "PATH": "/usr/bin:/bin",
+              "LANG": "C.UTF-8",
+              "HOME": "/nonexistent",
+              "DOCKER_API_VERSION": "1.54",
+          }
+          DOCKER = (
+              "/usr/bin/docker",
+              "--config",
+              CONFIG,
+              "--host",
+              "unix:///var/run/docker.sock",
+          )
+          COMMANDS = {
+              "active": ("/usr/bin/systemctl", "is-active", "docker.service"),
+              "pid": (
+                  "/usr/bin/systemctl",
+                  "show",
+                  "--property=MainPID",
+                  "--value",
+                  "docker.service",
+              ),
+              "version": (*DOCKER, "version", "--format", "{{json .}}"),
+              "info": (*DOCKER, "info", "--format", "{{json .}}"),
+              "containers": (*DOCKER, "ps", "--all", "--quiet", "--no-trunc"),
+              "networks": (*DOCKER, "network", "ls", "--quiet", "--no-trunc"),
+              "volumes": (*DOCKER, "volume", "ls", "--quiet"),
+              "plugins": (*DOCKER, "plugin", "ls", "--quiet", "--no-trunc"),
+          }
+          
+          
+          def bounded_command(key):
+              """Fixed argv, clean env, timeout/byte cap. Discard all raw diagnostics."""
+              process = subprocess.Popen(
+                  COMMANDS[key],
+                  stdin=subprocess.DEVNULL,
+                  stdout=subprocess.PIPE,
+                  stderr=subprocess.PIPE,
+                  env=ENV,
+                  cwd="/",
+                  start_new_session=True,
+              )
+              captured = bytearray()
+              total = 0
+              deadline = time.monotonic() + 12
+              selector = selectors.DefaultSelector()
+              selector.register(process.stdout, selectors.EVENT_READ, True)
+              selector.register(process.stderr, selectors.EVENT_READ, False)
+              try:
+                  while selector.get_map():
+                      if time.monotonic() >= deadline:
+                          raise ValueError("bounded read unavailable")
+                      for item, _mask in selector.select(0.1):
+                          data = os.read(item.fd, 65536)
+                          if not data:
+                              selector.unregister(item.fileobj)
+                              continue
+                          total += len(data)
+                          if total > 2 * 1024 * 1024:
+                              raise ValueError("bounded read unavailable")
+                          if item.data:
+                              captured.extend(data)
+                  process.wait(timeout=max(0.01, deadline - time.monotonic()))
+                  if process.returncode:
+                      raise ValueError("bounded read unavailable")
+                  return captured.decode("utf-8", errors="strict")
+              finally:
+                  selector.close()
+                  if process.poll() is None:
+                      os.killpg(process.pid, signal.SIGKILL)
+                  process.wait()
+                  process.stdout.close()
+                  process.stderr.close()
+          
+          
+          def read_file(path, limit=131072):
+              with open(path, "rb") as stream:
+                  data = stream.read(limit + 1)
+              if len(data) > limit:
+                  raise ValueError("bounded read unavailable")
+              return data
+          
+          
+          def clean_identifier(value, pattern):
+              return (
+                  value if isinstance(value, str) and re.fullmatch(pattern, value) else "UNKNOWN"
+              )
+          
+          
+          def enum(value, allowed):
+              return value if isinstance(value, str) and value in allowed else "UNKNOWN"
+          
+          
+          def binary_fact(path):
+              resolved = Path(path).resolve(strict=True)
+              metadata = resolved.stat()
+              if (
+                  not stat.S_ISREG(metadata.st_mode)
+                  or metadata.st_uid != 0
+                  or metadata.st_mode & 0o022
+              ):
+                  raise ValueError("unprotected executable")
+              digest = hashlib.sha256()
+              total = 0
+              with resolved.open("rb") as stream:
+                  while chunk := stream.read(1048576):
+                      total += len(chunk)
+                      if total > 256 * 1024 * 1024:
+                          raise ValueError("bounded read unavailable")
+                      digest.update(chunk)
+              return {"sha256_observed_only": digest.hexdigest(), "publisher_trust": "UNBOUND"}
+          
+          
+          def endpoint_gate(pid, reader=read_file):
+              if not re.fullmatch(r"[1-9][0-9]{0,7}", pid):
+                  return False
+              target = Path("/proc") / pid
+              if (target / "exe").resolve(strict=True) != Path("/usr/bin/dockerd").resolve(
+                  strict=True
+              ):
+                  return False
+              args = reader(target / "cmdline").split(b"\0")
+              # Permit the stock systemd fd:// listener, not an arbitrary remote endpoint.
+              flags = args[1:]
+              for index, arg in enumerate(flags):
+                  if arg == b"--config-file" or arg.startswith(b"--config-file="):
+                      return False
+                  if arg in {b"-H", b"--host"}:
+                      if index + 1 >= len(flags) or flags[index + 1] != b"fd://":
+                          return False
+                  elif arg.startswith((b"-H", b"--host=")) and arg not in {
+                      b"-Hfd://",
+                      b"--host=fd://",
+                  }:
+                      return False
+              meta = Path("/var/run/docker.sock").stat()
+              return stat.S_ISSOCK(meta.st_mode) and meta.st_uid == 0 and not meta.st_mode & 0o002
+          
+          
+          def collect(
+              command=bounded_command,
+              reader=read_file,
+              gate=endpoint_gate,
+              binary=binary_fact,
+              environ=None,
+          ):
+              source_env = os.environ if environ is None else environ
+              result = {
+                  "overall": "HOLD",
+                  "scope": "OBSERVATIONS_ONLY",
+                  "publisher_trust": "UNBOUND",
+                  "expected_base": BASE,
+                  "image_os": enum(source_env.get("ImageOS"), {"ubuntu26"}),
+                  "image_version": clean_identifier(
+                      source_env.get("ImageVersion"), r"[0-9]{8}\.[0-9]{1,6}\.[0-9]{1,3}"
+                  ),
+                  "runtime_enforcement": "NOT_TESTED",
+                  "egress": "NOT_TESTED",
+                  "raw_evidence": "NOT_PUBLISHED",
+              }
+              try:
+                  if Path(CONFIG).exists():
+                      raise ValueError("unexpected config")
+                  for name in ("docker", "dockerd", "containerd", "runc"):
+                      try:
+                          result[name + "_bytes"] = binary("/usr/bin/" + name)
+                      except (OSError, ValueError):
+                          result[name + "_bytes"] = "UNKNOWN"
+                  result["architecture"] = enum(os.uname().machine, {"x86_64"})
+                  result["cgroup_v2"] = Path("/sys/fs/cgroup/cgroup.controllers").is_file()
+                  result["apparmor_kernel"] = enum(
+                      reader("/sys/module/apparmor/parameters/enabled").decode().strip(),
+                      {"Y", "N"},
+                  )
+                  result["apparmor_default_profile_read"] = any(
+                      line == b"docker-default (enforce)"
+                      for line in reader("/sys/kernel/security/apparmor/profiles").splitlines()
+                  )
+              except (OSError, ValueError, UnicodeError):
+                  result["host_reads"] = "PARTIAL_OR_UNKNOWN"
+              result["firewall_tools_present"] = {
+                  name: Path("/usr/sbin/" + name).is_file()
+                  for name in ("iptables", "ip6tables", "nft")
+              }
+              result["effective_daemon_configuration"] = "UNBOUND"
+              result["firewall_policy"] = "NOT_TESTED"
+              try:
+                  config = json.loads(reader("/etc/docker/daemon.json"))
+                  if type(config) is not dict:
+                      raise ValueError("shape")
+                  result["daemon_config_has_hosts_override"] = "hosts" in config
+                  result["daemon_config_has_seccomp_override"] = "seccomp-profile" in config
+                  result["daemon_config_init"] = (
+                      config.get("init") if type(config.get("init")) is bool else "UNSPECIFIED"
+                  )
+                  if "hosts" in config:
+                      result["daemon"] = "CONFIG_ENDPOINT_OVERRIDE_UNREVIEWED"
+                      return result
+              except (OSError, ValueError, UnicodeError):
+                  result["daemon_config_read"] = "UNAVAILABLE_OR_ABSENT"
+              try:
+                  if command("active").strip() != "active":
+                      result["daemon"] = "INACTIVE_OR_UNKNOWN"
+                      return result
+                  pid = command("pid").strip()
+                  if not gate(pid):
+                      result["daemon"] = "ENDPOINT_UNBOUND"
+                      return result
+                  # Recheck before socket access. A service-exit race remains possible.
+                  if command("active").strip() != "active" or command("pid").strip() != pid:
+                      result["daemon"] = "CHANGED_BEFORE_READ"
+                      return result
+                  version = json.loads(command("version"))
+                  info = json.loads(command("info"))
+                  if type(version) is not dict or type(info) is not dict:
+                      raise ValueError("shape")
+                  for label in ("Client", "Server"):
+                      item = version.get(label, {})
+                      if type(item) is not dict:
+                          raise ValueError("shape")
+                      result[label.lower() + "_version"] = enum(item.get("Version"), {"29.4.2"})
+                      result[label.lower() + "_api"] = enum(item.get("ApiVersion"), {"1.54"})
+                  result["storage"] = enum(info.get("Driver"), {"overlay2", "overlayfs"})
+                  result["cgroup_version"] = enum(info.get("CgroupVersion"), {"2", "1"})
+                  result["cgroup_driver"] = enum(
+                      info.get("CgroupDriver"), {"systemd", "cgroupfs"}
+                  )
+                  result["runtime"] = enum(info.get("DefaultRuntime"), {"runc"})
+                  security = info.get("SecurityOptions", [])
+                  if type(security) is not list or any(type(x) is not str for x in security):
+                      raise ValueError("shape")
+                  result["seccomp_reported"] = any(
+                      x.startswith("name=seccomp,profile=builtin") for x in security
+                  )
+                  result["apparmor_reported"] = "name=apparmor" in security
+                  result["rootless_reported"] = "name=rootless" in security
+                  result["userns_reported"] = "name=userns" in security
+                  for key in ("containers", "networks", "volumes", "plugins"):
+                      lines = command(key).splitlines()
+                      result[key + "_count"] = min(len(lines), 10001)
+                  result["daemon"] = "READ_ONLY_RESPONSE_OBSERVED"
+              except (OSError, ValueError, UnicodeError, subprocess.SubprocessError):
+                  result["daemon"] = "PARTIAL_OR_UNKNOWN"
+              return result
+          
+          
+          def main():
+              if (
+                  os.environ.get("GITHUB_ACTIONS") != "true"
+                  or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted"
+              ):
+                  print('{"overall":"HOLD","scope":"NOT_HOSTED_RUNNER"}')
+                  return
+              try:
+                  result = collect()
+              except Exception:
+                  result = {"overall": "HOLD", "scope": "UNEXPECTED_READ_FAILURE"}
+              print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+          
+          
+          if __name__ == "__main__":
+              main()
+          PY
